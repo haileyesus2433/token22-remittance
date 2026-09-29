@@ -12,4 +12,10 @@ pub enum RemittanceError {
     Unauthorized,
     #[msg("Invalid extension configuration")]
     InvalidExtension,
+    #[msg("Transfer fee config extension is missing on mint")]
+    MissingTransferFeeConfig,
+    #[msg("Fee calculation overflow")]
+    FeeCalculationOverflow,
+    #[msg("Invalid mint account for token")]
+    InvalidMint,
 }

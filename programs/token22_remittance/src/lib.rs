@@ -24,4 +24,11 @@ pub mod token22_remittance {
     ) -> Result<()> {
         ctx.accounts.create_mint(transfer_fee_basis_points, maximum_fee, decimals)
     }
+
+    pub fn transfer_with_fee(
+        ctx: Context<TransferRemittanceWithFee>,
+        amount: u64,
+    ) -> Result<()> {
+        ctx.accounts.transfer_with_fee(amount)
+    }
 }
