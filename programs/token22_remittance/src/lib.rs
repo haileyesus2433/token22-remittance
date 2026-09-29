@@ -35,4 +35,13 @@ pub mod token22_remittance {
     pub fn thaw_kyc_account(ctx: Context<ThawKycAccount>) -> Result<()> {
         ctx.accounts.thaw()
     }
+
+    pub fn reissue_remittance_mint(
+        ctx: Context<ReissueRemittanceMint>,
+        transfer_fee_basis_points: u16,
+        maximum_fee: u64,
+        decimals: u8,
+    ) -> Result<()> {
+        ctx.accounts.reissue_mint(transfer_fee_basis_points, maximum_fee, decimals)
+    }
 }

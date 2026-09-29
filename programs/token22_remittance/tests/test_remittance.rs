@@ -539,3 +539,178 @@ fn test_individual_kyc_unfreeze_separate_from_mint_default_state() {
     assert!(res.is_err(), "Re-thawing an already unfrozen account must fail");
 }
 
+#[test]
+fn test_reissue_mint_permanent_delegate_and_confidential_transfers_manual_approval() {
+    let mut svm = LiteSVM::new();
+    let program_id = token22_remittance::id();
+    let bytes = include_bytes!("../../../target/deploy/token22_remittance.so");
+    svm.add_program(program_id, bytes).unwrap();
+
+    let payer = Keypair::new();
+    let mint = Keypair::new();
+    let mint_authority = Keypair::new();
+    let freeze_authority = Keypair::new();
+    let close_authority = Keypair::new();
+    let transfer_fee_config_authority = Keypair::new();
+    let withdraw_withheld_authority = Keypair::new();
+    let metadata_pointer_authority = Keypair::new();
+    let permanent_delegate = Keypair::new();
+    let confidential_transfer_authority = Keypair::new();
+
+    let alice = Keypair::new();
+    let treasury = Keypair::new();
+
+    svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
+    svm.airdrop(&permanent_delegate.pubkey(), 1_000_000_000).unwrap();
+    svm.airdrop(&freeze_authority.pubkey(), 1_000_000_000).unwrap();
+
+    let transfer_fee_basis_points = 200; // 2.0%
+    let maximum_fee = 20_000_000;
+    let decimals = 6;
+
+    // 1. Re-issue mint stacking all 6 extensions
+    let reissue_accounts = token22_remittance::accounts::ReissueRemittanceMint {
+        payer: payer.pubkey(),
+        mint: mint.pubkey(),
+        mint_authority: mint_authority.pubkey(),
+        freeze_authority: freeze_authority.pubkey(),
+        close_authority: close_authority.pubkey(),
+        transfer_fee_config_authority: transfer_fee_config_authority.pubkey(),
+        withdraw_withheld_authority: withdraw_withheld_authority.pubkey(),
+        metadata_pointer_authority: metadata_pointer_authority.pubkey(),
+        permanent_delegate: permanent_delegate.pubkey(),
+        confidential_transfer_authority: confidential_transfer_authority.pubkey(),
+        token_2022_program: anchor_spl::token_2022::ID,
+        system_program: SYSTEM_PROGRAM_ID,
+    };
+
+    let reissue_ix = Instruction {
+        program_id,
+        accounts: reissue_accounts.to_account_metas(None),
+        data: token22_remittance::instruction::ReissueRemittanceMint {
+            transfer_fee_basis_points,
+            maximum_fee,
+            decimals,
+        }.data(),
+    };
+
+    let msg = Message::new(&[reissue_ix], Some(&payer.pubkey()));
+    let tx = Transaction::new(&[&payer, &mint], msg, svm.latest_blockhash());
+    let res = svm.send_transaction(tx);
+    assert!(res.is_ok(), "Reissue mint failed: {:?}", res.err());
+
+    // 2. Verify all 6 extensions via StateReader
+    let mint_acc = svm.get_account(&mint.pubkey()).unwrap();
+    let mint_state = token22_remittance::state::StateReader::unpack_mint(&mint_acc.data).unwrap();
+
+    // Base mint
+    assert_eq!(mint_state.base.decimals, decimals);
+    assert_eq!(mint_state.base.mint_authority.unwrap(), mint_authority.pubkey());
+    assert_eq!(mint_state.base.freeze_authority.unwrap(), freeze_authority.pubkey());
+
+    // 1: TransferFeeConfig
+    let fee_cfg = token22_remittance::state::StateReader::get_transfer_fee_config(&mint_state).unwrap();
+    assert_eq!(u16::from(fee_cfg.newer_transfer_fee.transfer_fee_basis_points), transfer_fee_basis_points);
+
+    // 2: MetadataPointer
+    let meta_ptr = token22_remittance::state::StateReader::get_metadata_pointer(&mint_state).unwrap();
+    assert_eq!(Option::<Pubkey>::from(meta_ptr.metadata_address), Some(mint.pubkey()));
+
+    // 3: DefaultAccountState (Frozen)
+    let def_state = token22_remittance::state::StateReader::get_default_account_state(&mint_state).unwrap();
+    assert_eq!(AccountState::try_from(def_state.state).unwrap(), AccountState::Frozen);
+
+    // 4: MintCloseAuthority
+    let close_ext = token22_remittance::state::StateReader::get_mint_close_authority(&mint_state).unwrap();
+    assert_eq!(Option::<Pubkey>::from(close_ext.close_authority), Some(close_authority.pubkey()));
+
+    // 5: PermanentDelegate (Seizure Authority)
+    let perm_delegate_ext = token22_remittance::state::StateReader::get_permanent_delegate(&mint_state).unwrap();
+    assert_eq!(Option::<Pubkey>::from(perm_delegate_ext.delegate), Some(permanent_delegate.pubkey()));
+
+    // 6: ConfidentialTransferMint (approve_policy = manual -> auto_approve_new_accounts = false)
+    let ct_mint = token22_remittance::state::StateReader::get_confidential_transfer_mint(&mint_state).unwrap();
+    assert_eq!(Option::<Pubkey>::from(ct_mint.authority), Some(confidential_transfer_authority.pubkey()));
+    assert_eq!(bool::from(ct_mint.auto_approve_new_accounts), false);
+
+    // 3. Demonstrate PermanentDelegate seizure on standard plaintext balance
+    let alice_ata = anchor_spl::associated_token::get_associated_token_address_with_program_id(
+        &alice.pubkey(),
+        &mint.pubkey(),
+        &anchor_spl::token_2022::ID,
+    );
+    let treasury_ata = anchor_spl::associated_token::get_associated_token_address_with_program_id(
+        &treasury.pubkey(),
+        &mint.pubkey(),
+        &anchor_spl::token_2022::ID,
+    );
+
+    // Create ATAs
+    let create_alice_ix = anchor_spl::associated_token::spl_associated_token_account::instruction::create_associated_token_account(
+        &payer.pubkey(),
+        &alice.pubkey(),
+        &mint.pubkey(),
+        &anchor_spl::token_2022::ID,
+    );
+    let create_treasury_ix = anchor_spl::associated_token::spl_associated_token_account::instruction::create_associated_token_account(
+        &payer.pubkey(),
+        &treasury.pubkey(),
+        &mint.pubkey(),
+        &anchor_spl::token_2022::ID,
+    );
+    let msg = Message::new(&[create_alice_ix, create_treasury_ix], Some(&payer.pubkey()));
+    svm.send_transaction(Transaction::new(&[&payer], msg, svm.latest_blockhash())).unwrap();
+
+    // Thaw both ATAs
+    let thaw_alice = anchor_spl::token_2022::spl_token_2022::instruction::thaw_account(
+        &anchor_spl::token_2022::ID,
+        &alice_ata,
+        &mint.pubkey(),
+        &freeze_authority.pubkey(),
+        &[],
+    ).unwrap();
+    let thaw_treasury = anchor_spl::token_2022::spl_token_2022::instruction::thaw_account(
+        &anchor_spl::token_2022::ID,
+        &treasury_ata,
+        &mint.pubkey(),
+        &freeze_authority.pubkey(),
+        &[],
+    ).unwrap();
+    let msg = Message::new(&[thaw_alice, thaw_treasury], Some(&payer.pubkey()));
+    svm.send_transaction(Transaction::new(&[&payer, &freeze_authority], msg, svm.latest_blockhash())).unwrap();
+
+    // Mint 500 tokens to Alice
+    let mint_amount = 500_000_000u64;
+    let mint_ix = anchor_spl::token_2022::spl_token_2022::instruction::mint_to(
+        &anchor_spl::token_2022::ID,
+        &mint.pubkey(),
+        &alice_ata,
+        &mint_authority.pubkey(),
+        &[],
+        mint_amount,
+    ).unwrap();
+    let msg = Message::new(&[mint_ix], Some(&payer.pubkey()));
+    svm.send_transaction(Transaction::new(&[&payer, &mint_authority], msg, svm.latest_blockhash())).unwrap();
+
+    // Seizure: PermanentDelegate transfers Alice's tokens to treasury WITHOUT Alice's signature
+    let seize_ix = anchor_spl::token_2022::spl_token_2022::instruction::transfer_checked(
+        &anchor_spl::token_2022::ID,
+        &alice_ata,
+        &mint.pubkey(),
+        &treasury_ata,
+        &permanent_delegate.pubkey(), // Signed by PermanentDelegate
+        &[],
+        mint_amount,
+        decimals,
+    ).unwrap();
+    let msg = Message::new(&[seize_ix], Some(&permanent_delegate.pubkey()));
+    let tx = Transaction::new(&[&permanent_delegate], msg, svm.latest_blockhash());
+    let res = svm.send_transaction(tx);
+    assert!(res.is_ok(), "PermanentDelegate seizure failed: {:?}", res.err());
+
+    let alice_acc = svm.get_account(&alice_ata).unwrap();
+    let alice_state = token22_remittance::state::StateReader::unpack_account(&alice_acc.data).unwrap();
+    assert_eq!(alice_state.base.amount, 0); // Funds seized from sanctioned wallet!
+}
+
+

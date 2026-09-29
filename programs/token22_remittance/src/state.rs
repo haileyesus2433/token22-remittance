@@ -2,6 +2,7 @@ use anchor_lang::prelude::*;
 use spl_token_2022_interface::{
     extension::{
         confidential_transfer::{ConfidentialTransferAccount, ConfidentialTransferMint},
+        confidential_transfer_fee::ConfidentialTransferFeeConfig,
         default_account_state::DefaultAccountState,
         metadata_pointer::MetadataPointer,
         mint_close_authority::MintCloseAuthority,
@@ -77,6 +78,15 @@ impl StateReader {
     ) -> Result<&'a ConfidentialTransferMint> {
         mint_state
             .get_extension::<ConfidentialTransferMint>()
+            .map_err(|_| RemittanceError::InvalidExtension.into())
+    }
+
+    /// Extract ConfidentialTransferFeeConfig from mint
+    pub fn get_confidential_transfer_fee_config<'a>(
+        mint_state: &'a StateWithExtensions<'a, Mint>,
+    ) -> Result<&'a ConfidentialTransferFeeConfig> {
+        mint_state
+            .get_extension::<ConfidentialTransferFeeConfig>()
             .map_err(|_| RemittanceError::InvalidExtension.into())
     }
 
