@@ -31,4 +31,8 @@ pub mod token22_remittance {
     ) -> Result<()> {
         ctx.accounts.transfer_with_fee(amount)
     }
+
+    pub fn thaw_kyc_account(ctx: Context<ThawKycAccount>) -> Result<()> {
+        ctx.accounts.thaw()
+    }
 }

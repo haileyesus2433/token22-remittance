@@ -363,3 +363,179 @@ fn test_state_reader_with_extensions_and_rejection_of_raw_unpack() {
     assert!(perm_del.is_err());
 }
 
+#[test]
+fn test_individual_kyc_unfreeze_separate_from_mint_default_state() {
+    let mut svm = LiteSVM::new();
+    let program_id = token22_remittance::id();
+    let bytes = include_bytes!("../../../target/deploy/token22_remittance.so");
+    svm.add_program(program_id, bytes).unwrap();
+
+    let payer = Keypair::new();
+    let mint = Keypair::new();
+    let mint_authority = Keypair::new();
+    let freeze_authority = Keypair::new();
+    let close_authority = Keypair::new();
+    let transfer_fee_config_authority = Keypair::new();
+    let withdraw_withheld_authority = Keypair::new();
+    let metadata_pointer_authority = Keypair::new();
+
+    let alice = Keypair::new();
+    let bob = Keypair::new();
+    let charlie = Keypair::new();
+    let imposter = Keypair::new();
+
+    svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
+    svm.airdrop(&freeze_authority.pubkey(), 1_000_000_000).unwrap();
+    svm.airdrop(&imposter.pubkey(), 1_000_000_000).unwrap();
+
+    // 1. Create remittance mint
+    let create_mint_accounts = token22_remittance::accounts::CreateRemittanceMint {
+        payer: payer.pubkey(),
+        mint: mint.pubkey(),
+        mint_authority: mint_authority.pubkey(),
+        freeze_authority: freeze_authority.pubkey(),
+        close_authority: close_authority.pubkey(),
+        transfer_fee_config_authority: transfer_fee_config_authority.pubkey(),
+        withdraw_withheld_authority: withdraw_withheld_authority.pubkey(),
+        metadata_pointer_authority: metadata_pointer_authority.pubkey(),
+        token_2022_program: anchor_spl::token_2022::ID,
+        system_program: SYSTEM_PROGRAM_ID,
+    };
+
+    let create_mint_ix = Instruction {
+        program_id,
+        accounts: create_mint_accounts.to_account_metas(None),
+        data: token22_remittance::instruction::CreateRemittanceMint {
+            transfer_fee_basis_points: 100,
+            maximum_fee: 1_000_000,
+            decimals: 6,
+        }.data(),
+    };
+
+    let msg = Message::new(&[create_mint_ix], Some(&payer.pubkey()));
+    let tx = Transaction::new(&[&payer, &mint], msg, svm.latest_blockhash());
+    svm.send_transaction(tx).unwrap();
+
+    // 2. Create Alice and Bob ATAs
+    let alice_ata = anchor_spl::associated_token::get_associated_token_address_with_program_id(
+        &alice.pubkey(),
+        &mint.pubkey(),
+        &anchor_spl::token_2022::ID,
+    );
+    let bob_ata = anchor_spl::associated_token::get_associated_token_address_with_program_id(
+        &bob.pubkey(),
+        &mint.pubkey(),
+        &anchor_spl::token_2022::ID,
+    );
+
+    let create_alice_ix = anchor_spl::associated_token::spl_associated_token_account::instruction::create_associated_token_account(
+        &payer.pubkey(),
+        &alice.pubkey(),
+        &mint.pubkey(),
+        &anchor_spl::token_2022::ID,
+    );
+    let create_bob_ix = anchor_spl::associated_token::spl_associated_token_account::instruction::create_associated_token_account(
+        &payer.pubkey(),
+        &bob.pubkey(),
+        &mint.pubkey(),
+        &anchor_spl::token_2022::ID,
+    );
+
+    let msg = Message::new(&[create_alice_ix, create_bob_ix], Some(&payer.pubkey()));
+    let tx = Transaction::new(&[&payer], msg, svm.latest_blockhash());
+    svm.send_transaction(tx).unwrap();
+
+    // Verify both accounts start Frozen
+    let alice_acc = svm.get_account(&alice_ata).unwrap();
+    let alice_state = token22_remittance::state::StateReader::unpack_account(&alice_acc.data).unwrap();
+    assert_eq!(alice_state.base.state, AccountState::Frozen);
+
+    let bob_acc = svm.get_account(&bob_ata).unwrap();
+    let bob_state = token22_remittance::state::StateReader::unpack_account(&bob_acc.data).unwrap();
+    assert_eq!(bob_state.base.state, AccountState::Frozen);
+
+    // 3. Unauthorized freeze authority attempt fails
+    let imposter_thaw_ix = Instruction {
+        program_id,
+        accounts: token22_remittance::accounts::ThawKycAccount {
+            freeze_authority: imposter.pubkey(),
+            account: alice_ata,
+            mint: mint.pubkey(),
+            token_2022_program: anchor_spl::token_2022::ID,
+        }.to_account_metas(None),
+        data: token22_remittance::instruction::ThawKycAccount {}.data(),
+    };
+    let msg = Message::new(&[imposter_thaw_ix], Some(&imposter.pubkey()));
+    let tx = Transaction::new(&[&imposter], msg, svm.latest_blockhash());
+    let res = svm.send_transaction(tx);
+    assert!(res.is_err(), "Imposter thaw must be rejected");
+
+    // 4. Legitimate freeze authority thaws Alice after KYC
+    let thaw_alice_ix = Instruction {
+        program_id,
+        accounts: token22_remittance::accounts::ThawKycAccount {
+            freeze_authority: freeze_authority.pubkey(),
+            account: alice_ata,
+            mint: mint.pubkey(),
+            token_2022_program: anchor_spl::token_2022::ID,
+        }.to_account_metas(None),
+        data: token22_remittance::instruction::ThawKycAccount {}.data(),
+    };
+    let msg = Message::new(&[thaw_alice_ix], Some(&freeze_authority.pubkey()));
+    let tx = Transaction::new(&[&freeze_authority], msg, svm.latest_blockhash());
+    let res = svm.send_transaction(tx);
+    assert!(res.is_ok(), "Legitimate KYC thaw failed: {:?}", res.err());
+
+    // 5. Verify Alice is now Initialized (unfrozen)
+    let alice_acc_post = svm.get_account(&alice_ata).unwrap();
+    let alice_state_post = token22_remittance::state::StateReader::unpack_account(&alice_acc_post.data).unwrap();
+    assert_eq!(alice_state_post.base.state, AccountState::Initialized);
+
+    // 6. Verify Bob is STILL Frozen (isolation to individual KYC account)
+    let bob_acc_post = svm.get_account(&bob_ata).unwrap();
+    let bob_state_post = token22_remittance::state::StateReader::unpack_account(&bob_acc_post.data).unwrap();
+    assert_eq!(bob_state_post.base.state, AccountState::Frozen);
+
+    // 7. Verify mint-level DefaultAccountState remains Frozen
+    let mint_acc_post = svm.get_account(&mint.pubkey()).unwrap();
+    let mint_state_post = token22_remittance::state::StateReader::unpack_mint(&mint_acc_post.data).unwrap();
+    let default_state_ext = token22_remittance::state::StateReader::get_default_account_state(&mint_state_post).unwrap();
+    assert_eq!(AccountState::try_from(default_state_ext.state).unwrap(), AccountState::Frozen);
+
+    // 8. Create Charlie ATA *after* Alice's thaw - proves mint default state was NOT changed
+    let charlie_ata = anchor_spl::associated_token::get_associated_token_address_with_program_id(
+        &charlie.pubkey(),
+        &mint.pubkey(),
+        &anchor_spl::token_2022::ID,
+    );
+    let create_charlie_ix = anchor_spl::associated_token::spl_associated_token_account::instruction::create_associated_token_account(
+        &payer.pubkey(),
+        &charlie.pubkey(),
+        &mint.pubkey(),
+        &anchor_spl::token_2022::ID,
+    );
+    let msg = Message::new(&[create_charlie_ix], Some(&payer.pubkey()));
+    let tx = Transaction::new(&[&payer], msg, svm.latest_blockhash());
+    svm.send_transaction(tx).unwrap();
+
+    let charlie_acc = svm.get_account(&charlie_ata).unwrap();
+    let charlie_state = token22_remittance::state::StateReader::unpack_account(&charlie_acc.data).unwrap();
+    assert_eq!(charlie_state.base.state, AccountState::Frozen);
+
+    // 9. Thawing an already unfrozen account fails with AccountNotFrozen
+    let re_thaw_alice_ix = Instruction {
+        program_id,
+        accounts: token22_remittance::accounts::ThawKycAccount {
+            freeze_authority: freeze_authority.pubkey(),
+            account: alice_ata,
+            mint: mint.pubkey(),
+            token_2022_program: anchor_spl::token_2022::ID,
+        }.to_account_metas(None),
+        data: token22_remittance::instruction::ThawKycAccount {}.data(),
+    };
+    let msg = Message::new(&[re_thaw_alice_ix], Some(&freeze_authority.pubkey()));
+    let tx = Transaction::new(&[&freeze_authority], msg, svm.latest_blockhash());
+    let res = svm.send_transaction(tx);
+    assert!(res.is_err(), "Re-thawing an already unfrozen account must fail");
+}
+

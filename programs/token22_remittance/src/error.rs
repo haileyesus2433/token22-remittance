@@ -18,4 +18,6 @@ pub enum RemittanceError {
     FeeCalculationOverflow,
     #[msg("Invalid mint account for token")]
     InvalidMint,
+    #[msg("Account is not frozen")]
+    AccountNotFrozen,
 }
