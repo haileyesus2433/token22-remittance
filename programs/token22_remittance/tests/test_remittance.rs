@@ -284,3 +284,82 @@ fn test_transfer_with_fee_dynamic_calculation() {
     assert_eq!(u64::from(bob_fee_amount.withheld_amount), expected_fee);
 }
 
+#[test]
+fn test_state_reader_with_extensions_and_rejection_of_raw_unpack() {
+    let mut svm = LiteSVM::new();
+    let program_id = token22_remittance::id();
+    let bytes = include_bytes!("../../../target/deploy/token22_remittance.so");
+    svm.add_program(program_id, bytes).unwrap();
+
+    let payer = Keypair::new();
+    let mint = Keypair::new();
+    let mint_authority = Keypair::new();
+    let freeze_authority = Keypair::new();
+    let close_authority = Keypair::new();
+    let transfer_fee_config_authority = Keypair::new();
+    let withdraw_withheld_authority = Keypair::new();
+    let metadata_pointer_authority = Keypair::new();
+
+    svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
+
+    let transfer_fee_basis_points = 150;
+    let maximum_fee = 10_000_000;
+    let decimals = 9;
+
+    let accounts = token22_remittance::accounts::CreateRemittanceMint {
+        payer: payer.pubkey(),
+        mint: mint.pubkey(),
+        mint_authority: mint_authority.pubkey(),
+        freeze_authority: freeze_authority.pubkey(),
+        close_authority: close_authority.pubkey(),
+        transfer_fee_config_authority: transfer_fee_config_authority.pubkey(),
+        withdraw_withheld_authority: withdraw_withheld_authority.pubkey(),
+        metadata_pointer_authority: metadata_pointer_authority.pubkey(),
+        token_2022_program: anchor_spl::token_2022::ID,
+        system_program: SYSTEM_PROGRAM_ID,
+    };
+
+    let ix = Instruction {
+        program_id,
+        accounts: accounts.to_account_metas(None),
+        data: token22_remittance::instruction::CreateRemittanceMint {
+            transfer_fee_basis_points,
+            maximum_fee,
+            decimals,
+        }.data(),
+    };
+
+    let msg = Message::new(&[ix], Some(&payer.pubkey()));
+    let tx = Transaction::new(&[&payer, &mint], msg, svm.latest_blockhash());
+    svm.send_transaction(tx).unwrap();
+
+    let mint_acc = svm.get_account(&mint.pubkey()).unwrap();
+
+    // 1. Task 3 Principle: Raw unpack MUST FAIL on extended accounts
+    use anchor_lang::solana_program::program_pack::Pack;
+    let raw_unpack_res = anchor_spl::token::spl_token::state::Mint::unpack(&mint_acc.data);
+    assert!(raw_unpack_res.is_err(), "Raw unpack should fail on extended accounts");
+
+    // 2. StateReader (StateWithExtensions) successfully unpacks base and all stacked extensions
+    let mint_state = token22_remittance::state::StateReader::unpack_mint(&mint_acc.data).unwrap();
+    assert_eq!(mint_state.base.decimals, decimals);
+    assert_eq!(mint_state.base.mint_authority.unwrap(), mint_authority.pubkey());
+    assert_eq!(mint_state.base.freeze_authority.unwrap(), freeze_authority.pubkey());
+
+    let fee_cfg = token22_remittance::state::StateReader::get_transfer_fee_config(&mint_state).unwrap();
+    assert_eq!(u16::from(fee_cfg.newer_transfer_fee.transfer_fee_basis_points), transfer_fee_basis_points);
+
+    let default_state = token22_remittance::state::StateReader::get_default_account_state(&mint_state).unwrap();
+    assert_eq!(AccountState::try_from(default_state.state).unwrap(), AccountState::Frozen);
+
+    let meta_ptr = token22_remittance::state::StateReader::get_metadata_pointer(&mint_state).unwrap();
+    assert_eq!(Option::<Pubkey>::from(meta_ptr.metadata_address), Some(mint.pubkey()));
+
+    let close_ext = token22_remittance::state::StateReader::get_mint_close_authority(&mint_state).unwrap();
+    assert_eq!(Option::<Pubkey>::from(close_ext.close_authority), Some(close_authority.pubkey()));
+
+    // Missing extension safely returns error instead of crashing
+    let perm_del = token22_remittance::state::StateReader::get_permanent_delegate(&mint_state);
+    assert!(perm_del.is_err());
+}
+

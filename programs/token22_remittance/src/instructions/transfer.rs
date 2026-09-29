@@ -1,16 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token_2022::Token2022;
-use spl_token_2022_interface::{
-    extension::{
-        transfer_fee::{
-            instruction::transfer_checked_with_fee,
-            TransferFeeConfig,
-        },
-        BaseStateWithExtensions, StateWithExtensions,
-    },
-    state::{Account, Mint},
-};
-use crate::error::RemittanceError;
+use spl_token_2022_interface::extension::transfer_fee::instruction::transfer_checked_with_fee;
+use crate::{error::RemittanceError, state::StateReader};
 
 #[derive(Accounts)]
 pub struct TransferRemittanceWithFee<'info> {
@@ -34,16 +25,13 @@ impl<'info> TransferRemittanceWithFee<'info> {
     pub fn transfer_with_fee(&self, amount: u64) -> Result<()> {
         // Task 3: Read account/mint state exclusively through StateWithExtensions, never raw unpack
         let mint_data = self.mint.try_borrow_data()?;
-        let mint_state = StateWithExtensions::<Mint>::unpack(&mint_data)
-            .map_err(|_| RemittanceError::InvalidExtension)?;
+        let mint_state = StateReader::unpack_mint(&mint_data)?;
 
         let from_data = self.from.try_borrow_data()?;
-        let from_state = StateWithExtensions::<Account>::unpack(&from_data)
-            .map_err(|_| RemittanceError::InvalidExtension)?;
+        let from_state = StateReader::unpack_account(&from_data)?;
 
         let to_data = self.to.try_borrow_data()?;
-        let to_state = StateWithExtensions::<Account>::unpack(&to_data)
-            .map_err(|_| RemittanceError::InvalidExtension)?;
+        let to_state = StateReader::unpack_account(&to_data)?;
 
         // Safety checks on accounts
         require_keys_eq!(from_state.base.mint, *self.mint.key, RemittanceError::InvalidMint);
@@ -52,9 +40,7 @@ impl<'info> TransferRemittanceWithFee<'info> {
 
         // Task 2: dynamic fee via calculate_epoch_fee(current_epoch, amount) rather than cached rate
         let current_epoch = Clock::get()?.epoch;
-        let fee_config = mint_state
-            .get_extension::<TransferFeeConfig>()
-            .map_err(|_| RemittanceError::MissingTransferFeeConfig)?;
+        let fee_config = StateReader::get_transfer_fee_config(&mint_state)?;
 
         let fee = fee_config
             .calculate_epoch_fee(current_epoch, amount)
