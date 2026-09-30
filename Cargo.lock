@@ -79,7 +79,7 @@ dependencies = [
  "solana-bn254",
  "solana-clock 3.2.1",
  "solana-cpi",
- "solana-curve25519",
+ "solana-curve25519 3.1.14",
  "solana-hash 3.1.0",
  "solana-instruction 3.5.1",
  "solana-keccak-hasher",
@@ -2774,6 +2774,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "solana-curve25519"
+version = "4.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "14b4d2a4bf0d0b0a86c22111917e86e8bd39a7b31420fb2c7d73eb83761fc7af"
+dependencies = [
+ "bytemuck",
+ "bytemuck_derive",
+ "curve25519-dalek",
+ "solana-define-syscall 5.2.0",
+ "subtle",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "solana-define-syscall"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3793,6 +3807,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "solana-zk-elgamal-proof-interface"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8da7f01db2148a1dc16261ff1dc6f3930a1e255a33cece4f1b56658694f27f7"
+dependencies = [
+ "bytemuck",
+ "bytemuck_derive",
+ "num-derive",
+ "num-traits",
+ "solana-address 2.8.0",
+ "solana-instruction 3.5.1",
+ "solana-sdk-ids",
+ "solana-zk-sdk-pod",
+]
+
+[[package]]
 name = "solana-zk-elgamal-proof-program"
 version = "3.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3847,6 +3877,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "solana-zk-sdk-pod"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a800583b7a4cea3e851686af162cc6e4712eef97fa91dfa9aca2459b95c84777"
+dependencies = [
+ "base64 0.22.1",
+ "bytemuck",
+ "bytemuck_derive",
+ "solana-nullable",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "solana-zk-token-proof-program"
 version = "3.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3883,7 +3926,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha3",
- "solana-curve25519",
+ "solana-curve25519 3.1.14",
  "solana-derivation-path",
  "solana-instruction 3.5.1",
  "solana-pubkey 3.0.0",
@@ -4002,6 +4045,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "spl-token-confidential-transfer-ciphertext-arithmetic"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "939382702d0a4d8060a34aa3da8ccead2d6ed22985037e2af6ad7cc8ab743f3d"
+dependencies = [
+ "bytemuck",
+ "solana-curve25519 4.0.1",
+ "solana-zk-sdk-pod",
+]
+
+[[package]]
 name = "spl-token-confidential-transfer-proof-extraction"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4009,7 +4063,7 @@ checksum = "879a9ebad0d77383d3ea71e7de50503554961ff0f4ef6cbca39ad126e6f6da3a"
 dependencies = [
  "bytemuck",
  "solana-account-info",
- "solana-curve25519",
+ "solana-curve25519 3.1.14",
  "solana-instruction 3.5.1",
  "solana-instructions-sysvar",
  "solana-msg",
@@ -4204,14 +4258,20 @@ version = "0.1.0"
 dependencies = [
  "anchor-lang",
  "anchor-spl",
+ "bytemuck",
  "litesvm",
  "litesvm-token",
+ "solana-account",
  "solana-keypair",
  "solana-message",
  "solana-pubkey 4.4.0",
  "solana-signer",
  "solana-transaction",
+ "solana-zk-elgamal-proof-interface",
+ "solana-zk-sdk",
  "spl-token-2022-interface",
+ "spl-token-confidential-transfer-ciphertext-arithmetic",
+ "spl-token-confidential-transfer-proof-extraction",
  "spl-token-metadata-interface",
 ]
 

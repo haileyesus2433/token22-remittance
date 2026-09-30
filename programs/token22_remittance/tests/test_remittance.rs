@@ -713,4 +713,666 @@ fn test_reissue_mint_permanent_delegate_and_confidential_transfers_manual_approv
     assert_eq!(alice_state.base.amount, 0); // Funds seized from sanctioned wallet!
 }
 
+#[test]
+fn test_confidential_lifecycle_end_to_end() {
+    let mut svm = LiteSVM::new();
+    let program_id = token22_remittance::id();
+    let bytes = include_bytes!("../../../target/deploy/token22_remittance.so");
+    svm.add_program(program_id, bytes).unwrap();
+
+    let token_2022_zk_bytes = include_bytes!("fixtures/spl_token_2022_zk.so");
+    svm.add_program(anchor_spl::token_2022::ID, token_2022_zk_bytes).unwrap();
+
+    let payer = Keypair::new();
+    let mint = Keypair::new();
+    let mint_authority = Keypair::new();
+    let freeze_authority = Keypair::new();
+    let close_authority = Keypair::new();
+    let transfer_fee_config_authority = Keypair::new();
+    let withdraw_withheld_authority = Keypair::new();
+    let metadata_pointer_authority = Keypair::new();
+    let permanent_delegate = Keypair::new();
+    let confidential_transfer_authority = Keypair::new();
+
+    let alice = Keypair::new();
+    let charlie = Keypair::new(); // Third-party attacker trying to configure Alice's ATA
+
+    svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
+    svm.airdrop(&alice.pubkey(), 5_000_000_000).unwrap();
+    svm.airdrop(&charlie.pubkey(), 1_000_000_000).unwrap();
+    svm.airdrop(&freeze_authority.pubkey(), 1_000_000_000).unwrap();
+
+    let decimals = 6;
+
+    // 1. Re-issue mint with confidential transfer enabled
+    let reissue_accounts = token22_remittance::accounts::ReissueRemittanceMint {
+        payer: payer.pubkey(),
+        mint: mint.pubkey(),
+        mint_authority: mint_authority.pubkey(),
+        freeze_authority: freeze_authority.pubkey(),
+        close_authority: close_authority.pubkey(),
+        transfer_fee_config_authority: transfer_fee_config_authority.pubkey(),
+        withdraw_withheld_authority: withdraw_withheld_authority.pubkey(),
+        metadata_pointer_authority: metadata_pointer_authority.pubkey(),
+        permanent_delegate: permanent_delegate.pubkey(),
+        confidential_transfer_authority: confidential_transfer_authority.pubkey(),
+        token_2022_program: anchor_spl::token_2022::ID,
+        system_program: SYSTEM_PROGRAM_ID,
+    };
+
+    let reissue_ix = Instruction {
+        program_id,
+        accounts: reissue_accounts.to_account_metas(None),
+        data: token22_remittance::instruction::ReissueRemittanceMint {
+            transfer_fee_basis_points: 0,
+            maximum_fee: 0,
+            decimals,
+        }.data(),
+    };
+    svm.send_transaction(Transaction::new(&[&payer, &mint], Message::new(&[reissue_ix], Some(&payer.pubkey())), svm.latest_blockhash())).unwrap();
+
+    // 2. Create Alice's ATA (created by payer / anyone, starts Frozen)
+    let alice_ata = anchor_spl::associated_token::get_associated_token_address_with_program_id(
+        &alice.pubkey(),
+        &mint.pubkey(),
+        &anchor_spl::token_2022::ID,
+    );
+    let create_alice_ix = anchor_spl::associated_token::spl_associated_token_account::instruction::create_associated_token_account(
+        &payer.pubkey(),
+        &alice.pubkey(),
+        &mint.pubkey(),
+        &anchor_spl::token_2022::ID,
+    );
+    svm.send_transaction(Transaction::new(&[&payer], Message::new(&[create_alice_ix], Some(&payer.pubkey())), svm.latest_blockhash())).unwrap();
+
+    // 3. Thaw Alice via freeze authority
+    let thaw_ix = Instruction {
+        program_id,
+        accounts: token22_remittance::accounts::ThawKycAccount {
+            freeze_authority: freeze_authority.pubkey(),
+            account: alice_ata,
+            mint: mint.pubkey(),
+            token_2022_program: anchor_spl::token_2022::ID,
+        }.to_account_metas(None),
+        data: token22_remittance::instruction::ThawKycAccount {}.data(),
+    };
+    svm.send_transaction(Transaction::new(&[&freeze_authority], Message::new(&[thaw_ix], Some(&freeze_authority.pubkey())), svm.latest_blockhash())).unwrap();
+
+    // 4. Mint 1,000 plaintext tokens to Alice
+    let initial_mint = 1_000_000_000u64;
+    let mint_ix = anchor_spl::token_2022::spl_token_2022::instruction::mint_to(
+        &anchor_spl::token_2022::ID,
+        &mint.pubkey(),
+        &alice_ata,
+        &mint_authority.pubkey(),
+        &[],
+        initial_mint,
+    ).unwrap();
+    svm.send_transaction(Transaction::new(&[&payer, &mint_authority], Message::new(&[mint_ix], Some(&payer.pubkey())), svm.latest_blockhash())).unwrap();
+
+    // 5. Reallocate Alice ATA to include ConfidentialTransferAccount
+    let realloc_ix = spl_token_2022_interface::instruction::reallocate(
+        &anchor_spl::token_2022::ID,
+        &alice_ata,
+        &payer.pubkey(),
+        &alice.pubkey(),
+        &[],
+        &[
+            spl_token_2022_interface::extension::ExtensionType::ConfidentialTransferAccount,
+            spl_token_2022_interface::extension::ExtensionType::ConfidentialTransferFeeAmount,
+        ],
+    ).unwrap();
+    svm.send_transaction(Transaction::new(&[&payer, &alice], Message::new(&[realloc_ix], Some(&payer.pubkey())), svm.latest_blockhash())).unwrap();
+
+    // 6. Test ConfigureAccount: Prove owner-only (distinct from ATA creation-by-anyone)
+    let dummy_proof_account = Keypair::new();
+    let unauthorized_config_ix = Instruction {
+        program_id,
+        accounts: token22_remittance::accounts::ConfigureConfidentialAccount {
+            authority: charlie.pubkey(), // Imposter trying to configure Alice's ATA
+            account: alice_ata,
+            mint: mint.pubkey(),
+            proof_context_account: dummy_proof_account.pubkey(),
+            token_2022_program: anchor_spl::token_2022::ID,
+        }.to_account_metas(None),
+        data: token22_remittance::instruction::ConfigureConfidentialAccount {
+            decryptable_zero_balance: [0u8; 36],
+            maximum_pending_balance_credit_counter: 65536,
+        }.data(),
+    };
+    let res = svm.send_transaction(Transaction::new(&[&charlie], Message::new(&[unauthorized_config_ix], Some(&charlie.pubkey())), svm.latest_blockhash()));
+    assert!(res.is_err(), "Non-owner configuring account must fail with Unauthorized");
+
+    // Legitimate owner Alice configures account with verified PubkeyValidity proof context
+    let zk_elgamal_program_id = solana_pubkey::pubkey!("ZkE1Gama1Proof11111111111111111111111111111");
+    let alice_elgamal_keypair = solana_zk_sdk::encryption::elgamal::ElGamalKeypair::new_rand();
+    let alice_elgamal_pubkey: [u8; 32] = (*alice_elgamal_keypair.pubkey()).into();
+    let proof_context_key = Pubkey::new_unique();
+    let mut proof_data = Vec::new();
+    proof_data.extend_from_slice(alice.pubkey().as_ref()); // context_state_authority (32 bytes)
+    proof_data.push(4u8); // proof_type = ProofType::PubkeyValidity (4)
+    proof_data.extend_from_slice(&alice_elgamal_pubkey); // proof_context = PubkeyValidityProofContext (32 bytes)
+
+    svm.set_account(
+        proof_context_key,
+        solana_account::Account {
+            lamports: 10_000_000,
+            data: proof_data,
+            owner: zk_elgamal_program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    ).unwrap();
+
+    let config_alice_ix = Instruction {
+        program_id,
+        accounts: token22_remittance::accounts::ConfigureConfidentialAccount {
+            authority: alice.pubkey(), // Owner Alice
+            account: alice_ata,
+            mint: mint.pubkey(),
+            proof_context_account: proof_context_key,
+            token_2022_program: anchor_spl::token_2022::ID,
+        }.to_account_metas(None),
+        data: token22_remittance::instruction::ConfigureConfidentialAccount {
+            decryptable_zero_balance: [0u8; 36],
+            maximum_pending_balance_credit_counter: 65536,
+        }.data(),
+    };
+    let res = svm.send_transaction(Transaction::new(&[&alice], Message::new(&[config_alice_ix], Some(&alice.pubkey())), svm.latest_blockhash()));
+    assert!(res.is_ok(), "Configure account failed: {:?}", res.err());
+
+    // Verify account is configured but not yet approved (manual approval policy)
+    let alice_acc_post_config = svm.get_account(&alice_ata).unwrap();
+    let alice_state_post_config = token22_remittance::state::StateReader::unpack_account(&alice_acc_post_config.data).unwrap();
+    let ct_acc_post_config = token22_remittance::state::StateReader::get_confidential_transfer_account(&alice_state_post_config).unwrap();
+    assert_eq!(bool::from(ct_acc_post_config.approved), false);
+
+    // Confidential transfer authority approves Alice's account
+    let approve_alice_ix = Instruction {
+        program_id,
+        accounts: token22_remittance::accounts::ApproveConfidentialAccount {
+            authority: confidential_transfer_authority.pubkey(),
+            account: alice_ata,
+            mint: mint.pubkey(),
+            token_2022_program: anchor_spl::token_2022::ID,
+        }.to_account_metas(None),
+        data: token22_remittance::instruction::ApproveConfidentialAccount {}.data(),
+    };
+    let res = svm.send_transaction(Transaction::new(&[&payer, &confidential_transfer_authority], Message::new(&[approve_alice_ix], Some(&payer.pubkey())), svm.latest_blockhash()));
+    assert!(res.is_ok(), "Approve confidential account failed: {:?}", res.err());
+
+    // Verify account is now approved
+    let alice_acc_post_approve = svm.get_account(&alice_ata).unwrap();
+    let alice_state_post_approve = token22_remittance::state::StateReader::unpack_account(&alice_acc_post_approve.data).unwrap();
+    let ct_acc_post_approve = token22_remittance::state::StateReader::get_confidential_transfer_account(&alice_state_post_approve).unwrap();
+    assert_eq!(bool::from(ct_acc_post_approve.approved), true);
+
+    // 7. Deposit Confidential Tokens
+
+    // Plaintext amount decreases by deposit amount
+    let deposit_amount = 300_000_000u64; // 300 tokens
+    let deposit_ix = Instruction {
+        program_id,
+        accounts: token22_remittance::accounts::DepositConfidentialTokens {
+            authority: alice.pubkey(),
+            account: alice_ata,
+            mint: mint.pubkey(),
+            token_2022_program: anchor_spl::token_2022::ID,
+        }.to_account_metas(None),
+        data: token22_remittance::instruction::DepositConfidentialTokens {
+            amount: deposit_amount,
+            decimals,
+        }.data(),
+    };
+    let res = svm.send_transaction(Transaction::new(&[&alice], Message::new(&[deposit_ix], Some(&alice.pubkey())), svm.latest_blockhash()));
+    assert!(res.is_ok(), "Deposit confidential tokens failed: {:?}", res.err());
+
+    // Verify plaintext balance decreased by deposited amount
+    let alice_acc_post_deposit = svm.get_account(&alice_ata).unwrap();
+    let alice_state_post_deposit = token22_remittance::state::StateReader::unpack_account(&alice_acc_post_deposit.data).unwrap();
+    assert_eq!(alice_state_post_deposit.base.amount, initial_mint - deposit_amount);
+
+    // Verify pending balance credit counter incremented
+    let ct_acc = token22_remittance::state::StateReader::get_confidential_transfer_account(&alice_state_post_deposit).unwrap();
+    assert_eq!(u64::from(ct_acc.pending_balance_credit_counter), 1);
+
+    // 8. Apply Pending Balance
+    let apply_ix = Instruction {
+        program_id,
+        accounts: token22_remittance::accounts::ApplyPendingBalance {
+            authority: alice.pubkey(),
+            account: alice_ata,
+            token_2022_program: anchor_spl::token_2022::ID,
+        }.to_account_metas(None),
+        data: token22_remittance::instruction::ApplyPendingBalance {
+            expected_pending_balance_credit_counter: 1,
+            new_decryptable_available_balance: [0u8; 36],
+        }.data(),
+    };
+    let res = svm.send_transaction(Transaction::new(&[&alice], Message::new(&[apply_ix], Some(&alice.pubkey())), svm.latest_blockhash()));
+    assert!(res.is_ok(), "Apply pending balance failed: {:?}", res.err());
+
+    // Verify credit counter updated
+    let alice_acc_post_apply = svm.get_account(&alice_ata).unwrap();
+    let alice_state_post_apply = token22_remittance::state::StateReader::unpack_account(&alice_acc_post_apply.data).unwrap();
+    let ct_acc_post_apply = token22_remittance::state::StateReader::get_confidential_transfer_account(&alice_state_post_apply).unwrap();
+    assert_eq!(u64::from(ct_acc_post_apply.actual_pending_balance_credit_counter), 1);
+
+    // 9. Deposit another 100 tokens, then test Withdraw with apply_pending_balance_first = true
+    let second_deposit = 100_000_000u64;
+    let deposit2_ix = Instruction {
+        program_id,
+        accounts: token22_remittance::accounts::DepositConfidentialTokens {
+            authority: alice.pubkey(),
+            account: alice_ata,
+            mint: mint.pubkey(),
+            token_2022_program: anchor_spl::token_2022::ID,
+        }.to_account_metas(None),
+        data: token22_remittance::instruction::DepositConfidentialTokens {
+            amount: second_deposit,
+            decimals,
+        }.data(),
+    };
+    svm.send_transaction(Transaction::new(&[&alice], Message::new(&[deposit2_ix], Some(&alice.pubkey())), svm.latest_blockhash())).unwrap();
+
+    // Verify plaintext balance decreased again
+    let alice_acc_pre_withdraw = svm.get_account(&alice_ata).unwrap();
+    let alice_state_pre_withdraw = token22_remittance::state::StateReader::unpack_account(&alice_acc_pre_withdraw.data).unwrap();
+    assert_eq!(alice_state_pre_withdraw.base.amount, initial_mint - deposit_amount - second_deposit);
+
+    let ct_acc_pre_withdraw = token22_remittance::state::StateReader::get_confidential_transfer_account(&alice_state_pre_withdraw).unwrap();
+    assert_eq!(u64::from(ct_acc_pre_withdraw.pending_balance_credit_counter), 1);
+
+    // Compute expected available balance when pending balance is applied
+    let expected_available_balance: spl_token_2022_interface::solana_zk_sdk::encryption::pod::elgamal::PodElGamalCiphertext = bytemuck::cast(
+        spl_token_confidential_transfer_ciphertext_arithmetic::add_with_lo_hi(
+            &bytemuck::cast(ct_acc_pre_withdraw.available_balance),
+            &bytemuck::cast(ct_acc_pre_withdraw.pending_balance_lo),
+            &bytemuck::cast(ct_acc_pre_withdraw.pending_balance_hi),
+        ).unwrap()
+    );
+
+    // Create verified CiphertextCommitmentEquality proof context account for withdraw
+    let equality_proof_key = Pubkey::new_unique();
+    let equality_context = solana_zk_elgamal_proof_interface::proof_data::CiphertextCommitmentEqualityProofContext {
+        pubkey: bytemuck::cast(ct_acc_pre_withdraw.elgamal_pubkey),
+        ciphertext: bytemuck::cast(expected_available_balance),
+        commitment: bytemuck::Zeroable::zeroed(),
+    };
+    let equality_data = solana_zk_elgamal_proof_interface::state::ProofContextState::encode(
+        &alice.pubkey(),
+        solana_zk_elgamal_proof_interface::proof_data::ProofType::CiphertextCommitmentEquality,
+        &equality_context,
+    );
+    svm.set_account(
+        equality_proof_key,
+        solana_account::Account {
+            lamports: 10_000_000,
+            data: equality_data,
+            owner: zk_elgamal_program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    ).unwrap();
+
+    // Create verified BatchedRangeProofU64 proof context account for withdraw
+    let range_proof_key = Pubkey::new_unique();
+    let mut bit_lengths = [0u8; 8];
+    bit_lengths[0] = 64; // REMAINING_BALANCE_BIT_LENGTH
+    let range_context = solana_zk_elgamal_proof_interface::proof_data::BatchedRangeProofContext {
+        commitments: [equality_context.commitment; 8],
+        bit_lengths,
+    };
+    let range_data = solana_zk_elgamal_proof_interface::state::ProofContextState::encode(
+        &alice.pubkey(),
+        solana_zk_elgamal_proof_interface::proof_data::ProofType::BatchedRangeProofU64,
+        &range_context,
+    );
+
+    svm.set_account(
+        range_proof_key,
+        solana_account::Account {
+            lamports: 10_000_000,
+            data: range_data,
+            owner: zk_elgamal_program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    ).unwrap();
+
+    // 10. WithdrawConfidentialTokens with apply_pending_balance_first = true
+    // Verifies that pending balance is automatically applied into available balance before withdrawal executes
+    let withdraw_ix = Instruction {
+        program_id,
+        accounts: token22_remittance::accounts::WithdrawConfidentialTokens {
+            authority: alice.pubkey(),
+            account: alice_ata,
+            mint: mint.pubkey(),
+            equality_proof_account: equality_proof_key,
+            range_proof_account: range_proof_key,
+            token_2022_program: anchor_spl::token_2022::ID,
+        }.to_account_metas(None),
+        data: token22_remittance::instruction::WithdrawConfidentialTokens {
+            amount: 0,
+            decimals,
+            new_decryptable_available_balance: [0u8; 36],
+            apply_pending_balance_first: true,
+            expected_pending_balance_credit_counter: 1,
+            intermediate_decryptable_available_balance: Some([0u8; 36]),
+        }.data(),
+    };
+    let res = svm.send_transaction(Transaction::new(&[&alice], Message::new(&[withdraw_ix], Some(&alice.pubkey())), svm.latest_blockhash()));
+    assert!(res.is_ok(), "Withdraw with apply_pending_balance_first failed: {:?}", res.err());
+
+    // Verify pending balance was rolled into available balance (pending counter reset to 0, actual counter updated to 1)
+    let alice_acc_post_withdraw = svm.get_account(&alice_ata).unwrap();
+    let alice_state_post_withdraw = token22_remittance::state::StateReader::unpack_account(&alice_acc_post_withdraw.data).unwrap();
+    let ct_acc_post_withdraw = token22_remittance::state::StateReader::get_confidential_transfer_account(&alice_state_post_withdraw).unwrap();
+    assert_eq!(u64::from(ct_acc_post_withdraw.pending_balance_credit_counter), 0);
+    assert_eq!(u64::from(ct_acc_post_withdraw.actual_pending_balance_credit_counter), 1);
+    assert_eq!(ct_acc_post_withdraw.available_balance, expected_available_balance);
+}
+
+#[test]
+fn test_confidential_transfer_instruction_success() {
+    let mut svm = LiteSVM::new();
+    let program_id = token22_remittance::id();
+    let bytes = include_bytes!("../../../target/deploy/token22_remittance.so");
+    svm.add_program(program_id, bytes).unwrap();
+
+    let token_2022_zk_bytes = include_bytes!("fixtures/spl_token_2022_zk.so");
+    svm.add_program(anchor_spl::token_2022::ID, token_2022_zk_bytes).unwrap();
+
+    let payer = Keypair::new();
+    let mint = Keypair::new();
+    let mint_authority = Keypair::new();
+    let confidential_transfer_authority = Keypair::new();
+    let freeze_authority = Keypair::new();
+
+    let alice = Keypair::new();
+    let bob = Keypair::new();
+
+    svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
+    svm.airdrop(&alice.pubkey(), 5_000_000_000).unwrap();
+    svm.airdrop(&bob.pubkey(), 5_000_000_000).unwrap();
+
+    let decimals = 6;
+
+    // 1. Sizing and initializing mint with ConfidentialTransferMint
+    let extensions = [
+        spl_token_2022_interface::extension::ExtensionType::ConfidentialTransferMint,
+    ];
+    let space = spl_token_2022_interface::extension::ExtensionType::try_calculate_account_len::<Mint>(&extensions).unwrap();
+    let lamports = anchor_lang::solana_program::rent::Rent::default().minimum_balance(space);
+
+    let create_acc_ix = anchor_lang::solana_program::system_instruction::create_account(
+        &payer.pubkey(),
+        &mint.pubkey(),
+        lamports,
+        space as u64,
+        &anchor_spl::token_2022::ID,
+    );
+
+    let init_ct_mint_ix = spl_token_2022_interface::extension::confidential_transfer::instruction::initialize_mint(
+        &anchor_spl::token_2022::ID,
+        &mint.pubkey(),
+        Some(confidential_transfer_authority.pubkey()),
+        false, // manual approval
+        None,
+    ).unwrap();
+
+    let init_mint_ix = spl_token_2022_interface::instruction::initialize_mint2(
+        &anchor_spl::token_2022::ID,
+        &mint.pubkey(),
+        &mint_authority.pubkey(),
+        Some(&freeze_authority.pubkey()),
+        decimals,
+    ).unwrap();
+
+    let msg = Message::new(&[create_acc_ix, init_ct_mint_ix, init_mint_ix], Some(&payer.pubkey()));
+    svm.send_transaction(Transaction::new(&[&payer, &mint], msg, svm.latest_blockhash())).unwrap();
+
+    // 2. Create Alice and Bob ATAs
+    let alice_ata = anchor_spl::associated_token::get_associated_token_address_with_program_id(
+        &alice.pubkey(),
+        &mint.pubkey(),
+        &anchor_spl::token_2022::ID,
+    );
+    let bob_ata = anchor_spl::associated_token::get_associated_token_address_with_program_id(
+        &bob.pubkey(),
+        &mint.pubkey(),
+        &anchor_spl::token_2022::ID,
+    );
+
+    let create_alice = anchor_spl::associated_token::spl_associated_token_account::instruction::create_associated_token_account(
+        &payer.pubkey(),
+        &alice.pubkey(),
+        &mint.pubkey(),
+        &anchor_spl::token_2022::ID,
+    );
+    let create_bob = anchor_spl::associated_token::spl_associated_token_account::instruction::create_associated_token_account(
+        &payer.pubkey(),
+        &bob.pubkey(),
+        &mint.pubkey(),
+        &anchor_spl::token_2022::ID,
+    );
+    svm.send_transaction(Transaction::new(&[&payer], Message::new(&[create_alice, create_bob], Some(&payer.pubkey())), svm.latest_blockhash())).unwrap();
+
+    // 3. Mint 500 tokens to Alice
+    let mint_ix = anchor_spl::token_2022::spl_token_2022::instruction::mint_to(
+        &anchor_spl::token_2022::ID,
+        &mint.pubkey(),
+        &alice_ata,
+        &mint_authority.pubkey(),
+        &[],
+        500_000_000,
+    ).unwrap();
+    svm.send_transaction(Transaction::new(&[&payer, &mint_authority], Message::new(&[mint_ix], Some(&payer.pubkey())), svm.latest_blockhash())).unwrap();
+
+    // 4. Reallocate Alice and Bob for ConfidentialTransferAccount
+    let realloc_alice = spl_token_2022_interface::instruction::reallocate(
+        &anchor_spl::token_2022::ID,
+        &alice_ata,
+        &payer.pubkey(),
+        &alice.pubkey(),
+        &[],
+        &[spl_token_2022_interface::extension::ExtensionType::ConfidentialTransferAccount],
+    ).unwrap();
+    let realloc_bob = spl_token_2022_interface::instruction::reallocate(
+        &anchor_spl::token_2022::ID,
+        &bob_ata,
+        &payer.pubkey(),
+        &bob.pubkey(),
+        &[],
+        &[spl_token_2022_interface::extension::ExtensionType::ConfidentialTransferAccount],
+    ).unwrap();
+    svm.send_transaction(Transaction::new(&[&payer, &alice, &bob], Message::new(&[realloc_alice, realloc_bob], Some(&payer.pubkey())), svm.latest_blockhash())).unwrap();
+
+    // 5. Configure and approve Alice and Bob
+    let zk_elgamal_program_id = solana_pubkey::pubkey!("ZkE1Gama1Proof11111111111111111111111111111");
+
+    let alice_elgamal_keypair = solana_zk_sdk::encryption::elgamal::ElGamalKeypair::new_rand();
+    let alice_elgamal_pubkey: [u8; 32] = (*alice_elgamal_keypair.pubkey()).into();
+    let alice_proof_key = Pubkey::new_unique();
+    let mut alice_proof_data = Vec::new();
+    alice_proof_data.extend_from_slice(alice.pubkey().as_ref());
+    alice_proof_data.push(4u8);
+    alice_proof_data.extend_from_slice(&alice_elgamal_pubkey);
+    svm.set_account(alice_proof_key, solana_account::Account { lamports: 10_000_000, data: alice_proof_data, owner: zk_elgamal_program_id, executable: false, rent_epoch: 0 }).unwrap();
+
+    let bob_elgamal_keypair = solana_zk_sdk::encryption::elgamal::ElGamalKeypair::new_rand();
+    let bob_elgamal_pubkey: [u8; 32] = (*bob_elgamal_keypair.pubkey()).into();
+    let bob_proof_key = Pubkey::new_unique();
+    let mut bob_proof_data = Vec::new();
+    bob_proof_data.extend_from_slice(bob.pubkey().as_ref());
+    bob_proof_data.push(4u8);
+    bob_proof_data.extend_from_slice(&bob_elgamal_pubkey);
+    svm.set_account(bob_proof_key, solana_account::Account { lamports: 10_000_000, data: bob_proof_data, owner: zk_elgamal_program_id, executable: false, rent_epoch: 0 }).unwrap();
+
+    let config_alice = Instruction {
+        program_id,
+        accounts: token22_remittance::accounts::ConfigureConfidentialAccount {
+            authority: alice.pubkey(),
+            account: alice_ata,
+            mint: mint.pubkey(),
+            proof_context_account: alice_proof_key,
+            token_2022_program: anchor_spl::token_2022::ID,
+        }.to_account_metas(None),
+        data: token22_remittance::instruction::ConfigureConfidentialAccount {
+            decryptable_zero_balance: [0u8; 36],
+            maximum_pending_balance_credit_counter: 65536,
+        }.data(),
+    };
+    let config_bob = Instruction {
+        program_id,
+        accounts: token22_remittance::accounts::ConfigureConfidentialAccount {
+            authority: bob.pubkey(),
+            account: bob_ata,
+            mint: mint.pubkey(),
+            proof_context_account: bob_proof_key,
+            token_2022_program: anchor_spl::token_2022::ID,
+        }.to_account_metas(None),
+        data: token22_remittance::instruction::ConfigureConfidentialAccount {
+            decryptable_zero_balance: [0u8; 36],
+            maximum_pending_balance_credit_counter: 65536,
+        }.data(),
+    };
+    svm.send_transaction(Transaction::new(&[&alice], Message::new(&[config_alice], Some(&alice.pubkey())), svm.latest_blockhash())).unwrap();
+    svm.send_transaction(Transaction::new(&[&bob], Message::new(&[config_bob], Some(&bob.pubkey())), svm.latest_blockhash())).unwrap();
+
+    let approve_alice = Instruction {
+        program_id,
+        accounts: token22_remittance::accounts::ApproveConfidentialAccount {
+            authority: confidential_transfer_authority.pubkey(),
+            account: alice_ata,
+            mint: mint.pubkey(),
+            token_2022_program: anchor_spl::token_2022::ID,
+        }.to_account_metas(None),
+        data: token22_remittance::instruction::ApproveConfidentialAccount {}.data(),
+    };
+    let approve_bob = Instruction {
+        program_id,
+        accounts: token22_remittance::accounts::ApproveConfidentialAccount {
+            authority: confidential_transfer_authority.pubkey(),
+            account: bob_ata,
+            mint: mint.pubkey(),
+            token_2022_program: anchor_spl::token_2022::ID,
+        }.to_account_metas(None),
+        data: token22_remittance::instruction::ApproveConfidentialAccount {}.data(),
+    };
+    svm.send_transaction(Transaction::new(&[&payer, &confidential_transfer_authority], Message::new(&[approve_alice, approve_bob], Some(&payer.pubkey())), svm.latest_blockhash())).unwrap();
+
+    // 6. Alice deposits 300 tokens and applies pending balance
+    let deposit_alice = Instruction {
+        program_id,
+        accounts: token22_remittance::accounts::DepositConfidentialTokens {
+            authority: alice.pubkey(),
+            account: alice_ata,
+            mint: mint.pubkey(),
+            token_2022_program: anchor_spl::token_2022::ID,
+        }.to_account_metas(None),
+        data: token22_remittance::instruction::DepositConfidentialTokens {
+            amount: 300_000_000,
+            decimals,
+        }.data(),
+    };
+    svm.send_transaction(Transaction::new(&[&alice], Message::new(&[deposit_alice], Some(&alice.pubkey())), svm.latest_blockhash())).unwrap();
+
+    let apply_alice = Instruction {
+        program_id,
+        accounts: token22_remittance::accounts::ApplyPendingBalance {
+            authority: alice.pubkey(),
+            account: alice_ata,
+            token_2022_program: anchor_spl::token_2022::ID,
+        }.to_account_metas(None),
+        data: token22_remittance::instruction::ApplyPendingBalance {
+            expected_pending_balance_credit_counter: 1,
+            new_decryptable_available_balance: [0u8; 36],
+        }.data(),
+    };
+    svm.send_transaction(Transaction::new(&[&alice], Message::new(&[apply_alice], Some(&alice.pubkey())), svm.latest_blockhash())).unwrap();
+
+    // 7. Confidential Transfer from Alice to Bob
+    let alice_acc_post = svm.get_account(&alice_ata).unwrap();
+    let alice_state_post = token22_remittance::state::StateReader::unpack_account(&alice_acc_post.data).unwrap();
+    let ct_alice = token22_remittance::state::StateReader::get_confidential_transfer_account(&alice_state_post).unwrap();
+
+    // Proof 1: CiphertextCommitmentEquality
+    let equality_proof_key = Pubkey::new_unique();
+    let equality_context = solana_zk_elgamal_proof_interface::proof_data::CiphertextCommitmentEqualityProofContext {
+        pubkey: bytemuck::cast(ct_alice.elgamal_pubkey),
+        ciphertext: bytemuck::cast(ct_alice.available_balance),
+        commitment: bytemuck::Zeroable::zeroed(),
+    };
+    let equality_data = solana_zk_elgamal_proof_interface::state::ProofContextState::encode(
+        &alice.pubkey(),
+        solana_zk_elgamal_proof_interface::proof_data::ProofType::CiphertextCommitmentEquality,
+        &equality_context,
+    );
+    svm.set_account(equality_proof_key, solana_account::Account { lamports: 10_000_000, data: equality_data, owner: zk_elgamal_program_id, executable: false, rent_epoch: 0 }).unwrap();
+
+    // Proof 2: BatchedGroupedCiphertext3HandlesValidity
+    let validity_proof_key = Pubkey::new_unique();
+    let validity_context = solana_zk_elgamal_proof_interface::proof_data::BatchedGroupedCiphertext3HandlesValidityProofContext {
+        first_pubkey: bytemuck::cast(ct_alice.elgamal_pubkey),
+        second_pubkey: bytemuck::cast(bob_elgamal_pubkey),
+        third_pubkey: bytemuck::Zeroable::zeroed(),
+        grouped_ciphertext_lo: bytemuck::Zeroable::zeroed(),
+        grouped_ciphertext_hi: bytemuck::Zeroable::zeroed(),
+    };
+    let validity_data = solana_zk_elgamal_proof_interface::state::ProofContextState::encode(
+        &alice.pubkey(),
+        solana_zk_elgamal_proof_interface::proof_data::ProofType::BatchedGroupedCiphertext3HandlesValidity,
+        &validity_context,
+    );
+    svm.set_account(validity_proof_key, solana_account::Account { lamports: 10_000_000, data: validity_data, owner: zk_elgamal_program_id, executable: false, rent_epoch: 0 }).unwrap();
+
+    // Proof 3: BatchedRangeProofU128
+    let range_proof_key = Pubkey::new_unique();
+    let mut bit_lengths = [0u8; 8];
+    bit_lengths[0] = 64; // remaining balance
+    bit_lengths[1] = 16; // transfer amount lo
+    bit_lengths[2] = 32; // transfer amount hi
+    bit_lengths[3] = 16; // padding
+    let range_context = solana_zk_elgamal_proof_interface::proof_data::BatchedRangeProofContext {
+        commitments: [bytemuck::Zeroable::zeroed(); 8],
+        bit_lengths,
+    };
+    let range_data = solana_zk_elgamal_proof_interface::state::ProofContextState::encode(
+        &alice.pubkey(),
+        solana_zk_elgamal_proof_interface::proof_data::ProofType::BatchedRangeProofU128,
+        &range_context,
+    );
+    svm.set_account(range_proof_key, solana_account::Account { lamports: 10_000_000, data: range_data, owner: zk_elgamal_program_id, executable: false, rent_epoch: 0 }).unwrap();
+
+    let transfer_ix = Instruction {
+        program_id,
+        accounts: token22_remittance::accounts::ConfidentialTransfer {
+            authority: alice.pubkey(),
+            from: alice_ata,
+            mint: mint.pubkey(),
+            to: bob_ata,
+            equality_proof_account: equality_proof_key,
+            validity_proof_account: validity_proof_key,
+            range_proof_account: range_proof_key,
+            token_2022_program: anchor_spl::token_2022::ID,
+        }.to_account_metas(None),
+        data: token22_remittance::instruction::ConfidentialTransfer {
+            new_source_decryptable_available_balance: [0u8; 36],
+            transfer_amount_auditor_ciphertext_lo: [0u8; 64],
+            transfer_amount_auditor_ciphertext_hi: [0u8; 64],
+        }.data(),
+    };
+    let res = svm.send_transaction(Transaction::new(&[&alice], Message::new(&[transfer_ix], Some(&alice.pubkey())), svm.latest_blockhash()));
+    assert!(res.is_ok(), "Confidential transfer failed: {:?}", res.err());
+
+    // Verify Bob received confidential transfer into pending balance
+    let bob_acc_post = svm.get_account(&bob_ata).unwrap();
+    let bob_state_post = token22_remittance::state::StateReader::unpack_account(&bob_acc_post.data).unwrap();
+    let ct_bob_post = token22_remittance::state::StateReader::get_confidential_transfer_account(&bob_state_post).unwrap();
+    assert_eq!(u64::from(ct_bob_post.pending_balance_credit_counter), 1);
+}
+
+
+
 
